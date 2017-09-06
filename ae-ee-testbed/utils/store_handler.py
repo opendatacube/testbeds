@@ -7,7 +7,7 @@ import logging
 from enum import Enum
 
 from redis import StrictRedis
-from cloudpickle import loads, dumps
+from dill import loads, dumps
 
 
 FunctionTypes = Enum('FunctionTypes', ('PICKLED', 'TEXT', 'DSL'))
@@ -21,15 +21,15 @@ defined in the global or class scopes.
 
 class Function(object):
     # See above: it would be better to use Enum if they can be made to work...
-    PICKLED = 0
-    TEXT = 1
-    DSL = 2
-    TYPES = frozenset((PICKLED, TEXT, DSL))
-    '''Valid function types.'''
+    #PICKLED = 0
+    #TEXT = 1
+    #DSL = 2
+    #TYPES = frozenset((PICKLED, TEXT, DSL))
+    #'''Valid function types.'''
 
     '''Function and its metadata.'''
     def __init__(self, function_type, function):
-        if not function_type in self.TYPES:
+        if not function_type in FunctionTypes:
             raise ValueError('Invalid function type: %s', function_type)
         self.function_type = function_type
         self.function = function
@@ -65,7 +65,10 @@ class StoreHandler(object):
 
 
     def _make_key(self, *parts):
-        '''Build a redis key using the agreed delimiter.'''
+        '''Build a redis key using the agreed delimiter.
+
+        All `parts` are expected to be strings as redis only understand strings.
+        '''
         return self.DELIMITER.join(parts)
 
 
@@ -75,23 +78,25 @@ class StoreHandler(object):
         TODO (talk to Peter): Decide whether to use a MULTI/EXEC block. I don't think it is required
         as the incr operation reserves an id, so it doesn't matter if the following operations are
         done in the same transaction.
+        Use it for better performance: it should use a single packet.
 
         '''
         # Get new item id as incremental integer
         item_id = self._store.incr(self._make_key(key, self.K_COUNT))
 
         # Add pickled item to relevant list of items
-        self._store.set(self._make_key(key, str(item_id)), dumps(item))
+        self._store.set(self._make_key(key, str(item_id)), dumps(item, byref=True))
 
-        # Add item id to queued list of items
-        self._store.rpush(self._make_key(key, self.K_QUEUED), item_id)
+        if key == self.K_JOBS:
+            # Add job id to queued list of items
+            self._store.rpush(self._make_key(key, self.K_QUEUED), item_id)
 
         return item_id
 
 
     def _queued_items(self, key):
-        '''Returns the list of item ids currently in the queue.'''
-        return [item_id.decode('utf-8') for item_id \
+        '''Returns the list of item ids currently in the queue, as integers.'''
+        return [int(item_id) for item_id \
                 in self._store.lrange(self._make_key(key, self.K_QUEUED), 0, -1)]
 
 
@@ -116,6 +121,13 @@ class StoreHandler(object):
         return self._add_item(self.K_JOBS, job)
 
 
+    def add_result(self, result):
+        '''
+        if result is a list:
+            recursive add_result(item)
+        else:
+            add result item
+        '''
 
     def set_job_status(self):
         pass
@@ -159,22 +171,23 @@ if __name__ == '__main__':
     sh = StoreHandler('redis')
     sh._store.flushdb()
 
-    # Create 2 users with 7 jobs each. The function simply returns a string denoting the user and
+    # Create 2 users with 6 jobs each. The function simply returns a string denoting the user and
     # job number. Same for the data.
+    funcTypes = list(FunctionTypes)
     for user in range(2):
         user_id = 'user{:03d}'.format(user)
-        for job in range(7):
-            function = lambda: 'User {:03d}, job {:03d}'.format(user, job)
+        for job in range(6):
+            function = lambda user=user, job=job: 'User {:03d}, job {:03d}'.format(user, job)
             data = 'Data for {:03d}-{:03d}'.format(user, job)
             # Asign function type to same number as job % 3, for testing only!
-            sh.add_job(job % 3, function, data)
+            sh.add_job(funcTypes[job % 3], function, data)
 
     # List all keys in the store
     logger.debug(sh)
 
     # List all queued jobs
     job_ids = sh.queued_jobs()
-    logger.debug('Job IDs: %s', ', '.join(job_ids))
+    logger.debug('Job IDs: %s', job_ids)
 
     # Retrieve all job functions and data
     for job_id in job_ids:
@@ -183,15 +196,6 @@ if __name__ == '__main__':
         function = sh.get_function(function_id)
         data_id = job.data_id
         data = sh.get_data(data_id)
-        if function.function_type == 0:
-            function_type_str = 'Pickled'
-        elif function.function_type == 1:
-            function_type_str = 'Text'
-        elif function.function_type == 2:
-            function_type_str = 'DSL'
-        else:
-            function_type_str = 'Unknown'
-
-        logger.debug('Job #%3s has function #%3s (%s): "%s" and data #%3s: "%s"',
-                     job_id, function_id, function_type_str,
+        logger.debug('Job #%3s has function #%3s (%7s): "%s" and data #%3s: "%s"',
+                     job_id, function_id, function.function_type.name,
                      function.function(), data_id, data)
